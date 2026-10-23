@@ -1,0 +1,4 @@
+*.bin
+*.sr
+*.csv
+__pycache__/
