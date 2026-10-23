@@ -148,8 +148,8 @@ Example: `66 66 00 0E 08 00 00 00 10 27 1B 17 00 00 00 00 01 00 83 3A`
 | Bit | Meaning |
 |---|---|
 | `0x01` | Cruise control engaged (after ~7 s of steady throttle with P5 on; brake cancels) |
-| `0x02` | Motor driving (throttle applied) |
-| `0x04` | Seen only together with `0x02` in dual mode — probably front motor driving (unconfirmed) |
+| `0x02` | Rear motor driving (throttle applied) |
+| `0x04` | Front motor driving (dual mode + throttle; not set when the wheel is only turned by hand) |
 | `0x08` | Always set |
 | `0x10` | **Dual-motor** mode (the single/dual button is read by the controller) |
 
