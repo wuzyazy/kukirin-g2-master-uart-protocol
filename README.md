@@ -73,30 +73,59 @@ Example: `66 66 00 0A 01 00 65 00 14 03 00 00 00 00 C1 A0`
 
 | Offset | Size | Meaning |
 |---|---|---|
-| 0 | 1 | Flags: `0x01` display ready (0 for the first ~1 s after power-on), `0x08` headlight, `0x10` left turn signal, `0x20` right turn signal |
+| 0 | 1 | Flags (see below) |
 | 1 | 1 | 0 |
-| 2 | 1 | **Mode**: `0x63/0x64/0x65` = mode 1/2/3, `0x60/0x61/0x62` = **limited** mode 1/2/3 |
+| 2 | 1 | **Mode + PB**: bits 5–7 = **PB** (e-brake strength 0–5), bits 0–4 = **mode** (see below) |
 | 3 | 1 | 0 |
 | 4–5 | 2 | **Throttle**, 12-bit ADC (≈788 at rest, 4092 full) |
 | 6–7 | 2 | **Brake**: `0x0FFF` while the (right) brake lever is pulled, else 0 |
 | 8–9 | 2 | 0 (possibly the second brake — the left sensor on the test scooter was broken) |
 
+### Display flags (byte 0)
+
+| Bit | Meaning |
+|---|---|
+| `0x01` | Display ready (0 for the first ~1 s after power-on) |
+| `0x02` | **P5** cruise control enabled |
+| `0x04` | **P6** kick start (non-zero start) enabled |
+| `0x08` | Headlight |
+| `0x10` | Left turn signal |
+| `0x20` | Right turn signal |
+
 ### Modes and limited ("police") mode
 
-There is no separate flag: the display changes the mode value. **Limited = normal − 3.**
-The combo (hold right brake + press the power button twice) toggles it; the display does the combo
-logic itself and shows the icon.
+Mode = byte 2 **& 0x1F**. There is no separate limited flag: the display changes the mode value.
+**Limited = normal − 3.** The combo (hold right brake + press the power button twice) toggles it; the
+display does the combo logic itself and shows the icon.
 
-| Value | Meaning | Stock behaviour observed |
+| Mode (bits 0–4) | Meaning | Stock behaviour observed |
 |---|---|---|
-| `0x63` | Mode 1 | 20 km/h at half throttle (wheel in the air) |
-| `0x64` | Mode 2 | |
-| `0x65` | Mode 3 | 79 km/h (wheel in the air) |
-| `0x60` | Limited mode 1 | |
-| `0x61` | Limited mode 2 | |
-| `0x62` | Limited mode 3 | 25.4 km/h |
+| 3 | Mode 1 | 20 km/h at half throttle (wheel in the air) |
+| 4 | Mode 2 | |
+| 5 | Mode 3 | 79 km/h (wheel in the air) |
+| 0 | Limited mode 1 | |
+| 1 | Limited mode 2 | |
+| 2 | Limited mode 3 | 25.4 km/h |
 
-Pressing the power button also cycles the mode value, so the combo shows up as e.g. `65 → 63 → 64 → 61`.
+With the default PB = 3 the whole byte reads `0x63/0x64/0x65` (normal) and `0x60/0x61/0x62` (limited);
+with PB = 5 it reads `0xA3/0xA4/0xA5`. Pressing the power button also cycles the mode, so the combo
+shows up as e.g. `65 → 63 → 64 → 61`.
+
+### P-settings
+
+The display of the test unit (late-2025 Lenzod) has only **P1, P5, P6, P8, PB, PC** (no PA).
+Open with **3 quick presses of the power button** while standing still. Opening and browsing the menu
+sends nothing extra; the values that matter to the controller travel in the normal frame and change
+**live** while you edit them:
+
+| Code | Function | Where |
+|---|---|---|
+| P1 | km/h ↔ mph | display only (controller always sends 0.01 km/h) |
+| P5 | Cruise control on/off | display flags `0x02` |
+| P6 | Kick start (non-zero start) | display flags `0x04` |
+| P8 | Auto-off time | display only |
+| PB | Electronic brake strength 0–5 | byte 2, bits 5–7 |
+| PC | Odometer reset | display only |
 
 ## Controller → display (`LEN = 0x0E`, every ~130 ms)
 
@@ -104,22 +133,33 @@ Example: `66 66 00 0E 08 00 00 00 10 27 1B 17 00 00 00 00 01 00 83 3A`
 
 | Offset | Size | Meaning |
 |---|---|---|
-| 0 | 1 | Flags: `0x08` always set, `0x02` motor driving (throttle applied), `0x10` **dual-motor** mode |
-| 1–3 | 3 | 0 |
+| 0 | 1 | Flags (see below) |
+| 1 | 1 | **Error code** (0 = OK; `0x02`, then `0x03` when the display stops talking) |
+| 2–3 | 2 | 0 |
 | 4–5 | 2 | `10000` (`0x2710`) — meaning unknown, rarely dips to 9999/0; send 10000 |
 | 6–7 | 2 | **Battery voltage**, 0.01 V (5914 = 59.14 V, multimeter 59.1 V) |
-| 8–9 | 2 | **Speed**, 0.01 km/h (2030 → display 20, 7919 → display 79) |
-| 10–11 | 2 | 0 |
+| 8–9 | 2 | **Rear motor speed**, **signed** int16, 0.01 km/h (2030 → display 20, 7919 → display 79; backwards = negative) |
+| 10–11 | 2 | **Front motor speed**, signed int16, 0.01 km/h — non-zero only in dual mode |
 | 12 | 1 | 1 (briefly 0 now and then) |
 | 13 | 1 | 0 |
+
+### Controller flags (byte 0)
+
+| Bit | Meaning |
+|---|---|
+| `0x01` | Cruise control engaged (after ~7 s of steady throttle with P5 on; brake cancels) |
+| `0x02` | Motor driving (throttle applied) |
+| `0x04` | Seen only together with `0x02` in dual mode — probably front motor driving (unconfirmed) |
+| `0x08` | Always set |
+| `0x10` | **Dual-motor** mode (the single/dual button is read by the controller) |
 
 At power-on the first controller frame is all zeros except `08 … 01 00`, then `0x2710` and the voltage appear.
 
 ## Not covered yet
 
-* P-settings menu — nothing extra is sent during normal riding; the settings either stay in the display
-  or are sent only when edited.
-* Left brake (sensor broken on the test unit), cruise control, error codes.
+* Left brake (sensor broken on the test unit).
+* Other error codes (only the "display lost" codes `0x02`/`0x03` were seen).
+* Meaning of the constant `10000` and the byte that is normally 1.
 
 ## Relation to the Lenzod Bluetooth protocol
 
@@ -157,7 +197,7 @@ python dashboard/scooter_live.py --channel D0 --log ride_log.csv
 Shows speed gauge, mode / limited mode, throttle, battery, brake, headlight, turn signals and
 single/dual in real time. Expects `sigrok-cli.exe` in `%LOCALAPPDATA%\sigrok-cli\` (edit `SIGROK` at the
 top otherwise) and the analyzer with the WinUSB driver (Zadig). Close PulseView first.
-Keys: F11 fullscreen, R reset max speed, D raw frames.
+Keys: F11 fullscreen, R reset max speed, D raw frames, L lab panel (front/rear motor speed, P-settings, controller flags, error code, change log), P reset front-speed peak.
 
 ## Disclaimer
 

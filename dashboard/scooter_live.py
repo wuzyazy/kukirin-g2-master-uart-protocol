@@ -25,9 +25,10 @@ import tkinter as tk
 
 SIGROK = os.path.join(os.environ.get("LOCALAPPDATA", ""), "sigrok-cli", "sigrok-cli.exe")
 
+# Display byte 2 = (PB e-brake strength << 5) | mode; mode 3/4/5 normal, 0/1/2 limited.
 MODES = {
-    0x63: ("1", False), 0x64: ("2", False), 0x65: ("3", False),
-    0x60: ("1", True), 0x61: ("2", True), 0x62: ("3", True),
+    3: ("1", False), 4: ("2", False), 5: ("3", False),
+    0: ("1", True), 1: ("2", True), 2: ("3", True),
 }
 THR_MIN, THR_MAX = 788, 4092
 CELLS = 14  # 52 V pack
@@ -53,6 +54,12 @@ def crc_modbus(data):
         for _ in range(8):
             crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
     return crc
+
+
+def s16(lo, hi):
+    """Little-endian signed 16-bit."""
+    v = lo | hi << 8
+    return v - 0x10000 if v & 0x8000 else v
 
 
 def lerp(a, b, t):
@@ -172,6 +179,11 @@ class Dashboard:
         self.mode_flash = 0.0        # flash when the mode changes
         self.prev_mode = None
         self.t0 = time.time()
+        self.watched = {}
+        self.events = []
+        self.mystery_flash = 0.0
+        self.mystery_peak = 0
+        self.show_lab = True
 
         root.title("G2 Master — live")
         root.configure(bg=BG)
@@ -183,6 +195,8 @@ class Dashboard:
         root.bind("<Escape>", lambda e: self.set_fullscreen(False))
         root.bind("<r>", lambda e: setattr(self, "max_speed", 0.0))
         root.bind("<d>", lambda e: setattr(self, "show_raw", not self.show_raw))
+        root.bind("<l>", lambda e: setattr(self, "show_lab", not self.show_lab))
+        root.bind("<p>", lambda e: setattr(self, "mystery_peak", 0))
         self.root.after(int(1000 / FPS), self.frame)
 
     def set_fullscreen(self, on):
@@ -198,16 +212,33 @@ class Dashboard:
         s = self.state
         if ln == 0x0A:
             s["flags_a"] = p[0]
-            s["mode_raw"] = p[2]
+            s["mode_raw"] = p[2] & 0x1F
+            s["pb"] = p[2] >> 5
             s["throttle"] = p[4] | p[5] << 8
             s["brake"] = any(p[6:10])
-            if self.prev_mode is not None and p[2] != self.prev_mode:
+            if self.prev_mode is not None and s["mode_raw"] != self.prev_mode:
                 self.mode_flash = 1.0
-            self.prev_mode = p[2]
+            self.prev_mode = s["mode_raw"]
+            self.watch("display flags", f"0x{p[0]:02X}")
+            self.watch("PB", str(s["pb"]))
+            self.watch("display byte 1/3", f"{p[1]:02X} {p[3]:02X}")
         else:
             s["flags_b"] = p[0]
             s["volts"] = (p[6] | p[7] << 8) / 100
-            s["speed"] = (p[8] | p[9] << 8) / 100
+            # Speeds are signed int16 in 0.01 km/h (negative = wheel turning backwards).
+            s["rear"] = s16(p[8], p[9]) / 100
+            s["front"] = s16(p[10], p[11]) / 100   # front motor, only non-zero in dual mode
+            s["speed"] = abs(s["rear"])
+            s["error"] = p[1]
+            s["mystery"] = s["front"]
+            if s["mystery"] != self.state.get("_mystery_prev"):
+                self.mystery_flash = 1.0
+                if s["mystery"] > self.mystery_peak:
+                    self.mystery_peak = s["mystery"]
+            s["_mystery_prev"] = s["mystery"]
+            self.watch("ctrl flags", f"0x{p[0]:02X}")
+            self.watch("error", f"0x{p[1]:02X}")
+            self.watch("front motor", "stopped" if not s["front"] else ("reverse" if s["front"] < 0 else "turning"))
             self.max_speed = max(self.max_speed, s["speed"])
             if self.log:
                 fa = s.get("flags_a", 0)
@@ -216,6 +247,17 @@ class Dashboard:
                                f"{int(s.get('brake', False))},{int(bool(fa & 0x08))},{int(bool(fa & 0x10))},"
                                f"{int(bool(fa & 0x20))},{int(bool(p[0] & 0x10))},{int(bool(p[0] & 0x02))}\n")
         self.raws[ln] = " ".join(f"{x:02X}" for x in fr)
+
+    def watch(self, name, value, quiet=False):
+        """Log a timestamped event whenever a watched field changes."""
+        old = self.watched.get(name)
+        self.watched[name] = value
+        if old is not None and old != value:
+            stamp = time.strftime("%H:%M:%S")
+            self.events.append((time.time(), f"{stamp}  {name}: {old} → {value}"))
+            self.events = self.events[-7:]
+            if self.log:
+                self.log.write(f"# {stamp} {name}: {old} -> {value}\n")
 
     def pump(self):
         try:
@@ -267,6 +309,7 @@ class Dashboard:
         for key, tv in targets.items():
             self.glow[key] = lerp(self.glow[key], tv, 0.45 if key in ("left", "right") else 0.25)
         self.mode_flash = max(0.0, self.mode_flash - 1.0 / (FPS * 0.6))
+        self.mystery_flash = max(0.0, self.mystery_flash - 1.0 / (FPS * 0.8))
 
         self.draw(now, linked)
         self.root.after(int(1000 / FPS), self.frame)
@@ -383,7 +426,7 @@ class Dashboard:
         c.create_oval(24 * u, H - 34 * u, 40 * u, H - 18 * u, fill=lc, outline="")
         status = "LIVE" if linked else ("NO SIGNAL — turn the scooter on" if not self.err_text else self.err_text)
         c.create_text(52 * u, H - 26 * u, text=status, fill=lc if linked else MUTED, font=f(15), anchor="w")
-        c.create_text(W - 24 * u, H - 26 * u, text=f"frames {st['ok']}   bad {st['bad']}   ·   F11 fullscreen   R reset max   D raw",
+        c.create_text(W - 24 * u, H - 26 * u, text=f"frames {st['ok']}   bad {st['bad']}   ·   F11 fullscreen   R reset max   D raw   L lab",
                       fill=GRID, font=f(13, "normal"), anchor="e")
         if self.show_raw:
             y = H - 80 * u
@@ -392,10 +435,54 @@ class Dashboard:
                               font=("Consolas", max(6, int(13 * u))), anchor="w")
                 y += 22 * u
 
+        if self.show_lab:
+            self.draw_lab(now, linked, f, u, W, H)
+
         # waiting overlay
         if not linked and not self.sweep_start:
             pulse = 0.5 + 0.5 * math.sin(now * 3)
             c.create_text(cx, cy + R * 0.72, text="WAITING FOR SCOOTER", fill=mix(GRID, CYAN, pulse * 0.7), font=f(22))
+
+    def draw_lab(self, now, linked, f, u, W, H):
+        """Top-left: unknown controller value (bytes 10-11) + change log.
+        Top-right: display P-settings and controller status bits."""
+        c = self.c
+        s = self.state
+        # --- mystery value box ---
+        x, y, w, h = 20 * u, 20 * u, 300 * u, 150 * u
+        val = s.get("mystery", 0) if linked else 0
+        fl = self.mystery_flash
+        border = mix(GRID, YELLOW, max(fl, 0.35 if val else 0.0))
+        c.create_rectangle(x, y, x + w, y + h, outline=border, width=max(1, 2 * u), fill=mix(BG, YELLOW, fl * 0.18))
+        rear = s.get("rear", 0.0) if linked else 0.0
+        c.create_text(x + 12 * u, y + 18 * u, text="FRONT / REAR MOTOR  km/h", fill=MUTED, font=f(12), anchor="w")
+        c.create_text(x + 12 * u, y + 70 * u, text=f"{val:.1f}", fill=mix(TEXT, YELLOW, max(fl, 0.6 if val else 0)), font=f(40), anchor="w")
+        c.create_text(x + w - 12 * u, y + 70 * u, text=f"{rear:.1f}", fill=TEXT, font=f(28), anchor="e")
+        c.create_text(x + 12 * u, y + 122 * u, text=f"front  ·  peak {self.mystery_peak:.1f} (P)", fill=MUTED, font=f(12, "normal"), anchor="w")
+        c.create_text(x + w - 12 * u, y + 122 * u, text="rear", fill=MUTED, font=f(12, "normal"), anchor="e")
+        # change log
+        ey = y + h + 18 * u
+        c.create_text(x, ey, text="CHANGES", fill=MUTED, font=f(12), anchor="w")
+        for i, (t, txt) in enumerate(reversed(self.events)):
+            age = now - t
+            col = mix(YELLOW, MUTED, min(1.0, age / 6))
+            c.create_text(x, ey + (i + 1) * 22 * u, text=txt, fill=col, font=("Consolas", max(6, int(12 * u))), anchor="w")
+
+        # --- settings + status (top-right) ---
+        fa, fb = s.get("flags_a", 0), s.get("flags_b", 0)
+        rows = [
+            ("PB e-brake", str(s.get("pb", "–")), CYAN),
+            ("P5 cruise", "ON" if fa & 0x02 else "off", GREEN if fa & 0x02 else MUTED),
+            ("P6 kick start", "ON" if fa & 0x04 else "off", GREEN if fa & 0x04 else MUTED),
+            ("cruise active", "YES" if fb & 0x01 else "no", ORANGE if fb & 0x01 else MUTED),
+            ("ctrl flag 0x04", "SET" if fb & 0x04 else "–", YELLOW if fb & 0x04 else MUTED),
+            ("error code", f"0x{s.get('error', 0):02X}", RED if s.get("error") else MUTED),
+        ]
+        rx = W - 20 * u
+        for i, (name, value, colr) in enumerate(rows):
+            ry = 30 * u + i * 30 * u
+            c.create_text(rx - 110 * u, ry, text=name, fill=MUTED, font=f(13, "normal"), anchor="e")
+            c.create_text(rx, ry, text=value if linked else "–", fill=colr if linked else GRID, font=f(15), anchor="e")
 
     def pill(self, x1, y1, x2, y2, outline, fill=BG, width=2):
         r = (y2 - y1) / 2
